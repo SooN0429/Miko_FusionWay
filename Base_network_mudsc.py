@@ -229,6 +229,57 @@ class WeightFusion:
             return self.get_merged_state_dict(no_avg=True)
         return self.fusion_model
 
+    @staticmethod
+    def _unpack_act_batch(batch):
+        """
+        Support common batch formats:
+        - (x, y)
+        - (x, y, test_flag)
+        - {"x": x, "test_flag": bool}
+        """
+        test_flag = None
+        if isinstance(batch, dict):
+            x = batch.get("x", batch.get("img", batch.get("image")))
+            test_flag = batch.get("test_flag", None)
+            if x is None:
+                raise ValueError("Dict batch must include one of keys: x/img/image")
+            return x, test_flag
+
+        if isinstance(batch, (tuple, list)):
+            if len(batch) == 0:
+                raise ValueError("Empty batch is not supported")
+            x = batch[0]
+            if len(batch) >= 3:
+                test_flag = batch[2]
+            return x, test_flag
+
+        return batch, None
+
+    @staticmethod
+    def _normalize_test_flag(test_flag):
+        if test_flag is None:
+            return None
+        if isinstance(test_flag, torch.Tensor):
+            if test_flag.numel() == 1:
+                return bool(test_flag.item())
+            # If a batch of same flag values is passed, use first one.
+            return bool(test_flag.reshape(-1)[0].item())
+        return bool(test_flag)
+
+    @staticmethod
+    def _forward_with_optional_flag(net, x, test_flag):
+        test_flag = WeightFusion._normalize_test_flag(test_flag)
+        if test_flag is None:
+            try:
+                return net(x)
+            except TypeError:
+                # For models like resnet18_multi.forward(x, test_flag)
+                return net(x, True)
+        try:
+            return net(x, test_flag)
+        except TypeError:
+            return net(x)
+
     def gen_act_sims(self, nets, act_loader: DataLoader):
         sims_dict = {k: CovarianceMetric() for k in self.perm}
         device = list(nets[0].parameters())[0].device
@@ -278,10 +329,11 @@ class WeightFusion:
             net.eval().cuda()
             add_hooks(net, i)
         with torch.no_grad():
-            for img, _ in tqdm(act_loader, desc="Computing activation"):
+            for batch in tqdm(act_loader, desc="Computing activation"):
+                img, test_flag = self._unpack_act_batch(batch)
                 img = img.cuda()
                 for net in nets:
-                    net(img)
+                    self._forward_with_optional_flag(net, img, test_flag)
                 for k, s in sims_dict.items():
                     if k not in feats[0]:
                         continue
