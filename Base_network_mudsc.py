@@ -399,16 +399,61 @@ class WeightFusion:
             self.perm_mats = self.best_perm_mats
         self.best_perm_mats = None
 
-    def perm_(self, axis, ws, perm_mat):
+    # 新增部分(針對特定軸進行切片操作)
+    @staticmethod
+    def _narrow_along_axis(x: torch.Tensor, axis: int, slc):
+        if slc is None:
+            return x
+        start, end = slc
+        if start is None:
+            start = 0
+        if end is None:
+            end = x.shape[axis]
+        if start < 0 or end > x.shape[axis] or end <= start:
+            raise ValueError(f"Invalid slice {slc} for shape {tuple(x.shape)} at axis={axis}")
+        return x.narrow(axis, start, end - start)
+
+    @staticmethod
+    def _apply_perm_to_slice(w_t: torch.Tensor, merge_mat: torch.Tensor, slc):
+        """
+        Apply merge_mat to the first dimension (rows) of w_t, optionally restricted to a slice.
+        w_t is expected to have the permuted axis moved to dim=0 already.
+        """
+        if slc is None:
+            raw_dim = w_t.shape[0]
+            out_dim = merge_mat.shape[0]
+            return torch.matmul(merge_mat, w_t.reshape(raw_dim, -1)).reshape(out_dim, *w_t.shape[1:])
+
+        start, end = slc
+        if start is None:
+            start = 0
+        if end is None:
+            end = w_t.shape[0]
+        if start < 0 or end > w_t.shape[0] or end <= start:
+            raise ValueError(f"Invalid slice {slc} for shape {tuple(w_t.shape)} at dim0")
+
+        before = w_t[:start]
+        mid = w_t[start:end]
+        after = w_t[end:]
+        raw_dim = mid.shape[0]
+        out_dim = merge_mat.shape[0]
+        mid_out = torch.matmul(merge_mat, mid.reshape(raw_dim, -1)).reshape(out_dim, *mid.shape[1:])
+        return torch.cat([before, mid_out, after], dim=0)
+    # 新增部分(針對特定軸進行切片操作)
+    def perm_(self, axis, ws, perm_mat, slc=None):
         ws_perm = []
         perm_mat = perm_mat.chunk(len(self.params), dim=0)
         for i, w in enumerate(ws):
             w = torch.transpose(w, axis, 0)
             shape = list(w.shape)
             merge_mat = perm_mat[i].T
-            raw_dim = shape[0]
-            shape[0] = merge_mat.shape[0]
-            w = torch.matmul(merge_mat, w.reshape(raw_dim, -1)).reshape(*shape)
+            if slc is None: # 如果沒有指定切片，則進行全體排列
+                raw_dim = shape[0]
+                shape[0] = merge_mat.shape[0]
+                w = torch.matmul(merge_mat, w.reshape(raw_dim, -1)).reshape(*shape)
+            else:
+                # Apply permutation to a sub-range along the permuted axis. # 如果指定了切片，則進行切片操作
+                w = self._apply_perm_to_slice(w, merge_mat, slc)
             ws_perm.append(torch.transpose(w, 0, axis))
         return ws_perm
 
@@ -425,8 +470,9 @@ class WeightFusion:
                 if p_ in self.perm_mats:
                     select = 0 if "in" in cfg_ else 1
                     perm_mat = self.perm_mats[p_][select]
-                    ws = self.perm_(a_, ws, perm_mat)
+                    ws = self.perm_(a_, ws, perm_mat, slc=cfg_.get("slice")) # 將切片操作傳遞給 perm_ 函數
             for i, w_ in enumerate(ws):
+                w_ = self._narrow_along_axis(w_, axis, cfg.get("slice")) # 將切片操作傳遞給 _narrow_along_axis 函數
                 n = w_.shape[axis]
                 weight_vectors[i].append(torch.transpose(w_, axis, 0).reshape(n, -1))
         return [torch.concat(wv, dim=1) for wv in weight_vectors]
@@ -582,7 +628,7 @@ class WeightFusion:
             for a, p, cfg in v:
                 select = 1 if "in" in cfg else 0
                 perm_mat = self.perm_mats[p][select]
-                ws = self.perm_(a, ws, perm_mat)
+                ws = self.perm_(a, ws, perm_mat, slc=cfg.get("slice")) # 將切片操作傳遞給 perm_ 函數
             merged_dict[wk] = ws if no_avg else sum(w for w in ws) / len(ws)
 
         for wk in rest_keys:
@@ -756,9 +802,9 @@ def get_convm2_perm(prefix="convm2_layer.0", ignore_running_val=True, include_fi
     ]
     cur_perm += 1
 
-    # P5：branch3 主座標節點 (64)：僅保留 n=64 的權重軸。
-    # ConvTranspose2d 於 groups>1 時，axis 1 對應 out_c/groups（本模型為 16），
-    # 不能與 n=64 的項目放在同一節點，否則 get_weight_vectors 會在 concat 時維度衝突。
+    # P5：branch3 主座標節點 (64)：以 forward 的 64 通道座標為主。
+    # ConvTranspose2d 於 groups>1 時，axis 1 會對應 out_c/groups（本模型為 16），
+    # 該維度是 group-內座標，非 forward 的 64 通道座標；因此此處不納入 perm。
     perm[cur_perm] = [
         [0, f"{prefix}.branch3_1.conv.weight"],
         [0, f"{prefix}.branch3_1.bn.weight"],
@@ -776,14 +822,6 @@ def get_convm2_perm(prefix="convm2_layer.0", ignore_running_val=True, include_fi
         [0, f"{prefix}.branch3_3.bn.running_mean", running_cfg],
         [0, f"{prefix}.branch3_3.bn.running_var", running_cfg],
     ]
-
-    # P5b：grouped deconv 的 group-內座標節點 (16)。
-    # 專門放 ConvTranspose2d 的 axis=1（out_c/groups）以保持節點內 n 一致。
-    cur_perm += 1
-    perm[cur_perm] = [
-        [1, f"{prefix}.branch3_2.deconv.weight"],
-        [1, f"{prefix}.branch3_3.deconv.weight"],
-    ]
     # 原說法：
             # P6：最終輸出座標，對應 (cat(x_branch1, x_branch2, x_branch3) + x_residual)
             # 將最終相加兩側的來源分支(x_branch1, x_branch2, x_branch3、x_residual)綁到同一座標系，並把該座標串接到 linear_test 的輸入。
@@ -792,14 +830,47 @@ def get_convm2_perm(prefix="convm2_layer.0", ignore_running_val=True, include_fi
             #兩者的座標放入perm中約束。
             #"在單模型訓練時，Add 兩側會被共同訓練「自然協調」；
             #在跨模型融合時，進入支點的是「各自模型對齊後」的表示，不一定天然同座標，因此要在支點前施加通道對應約束。"
-    # P6：最終輸出座標錨點，對應 conv_M2 最終 320 通道輸出 -> linear_test 輸入。
-    # 注意：這裡僅保留「同一 320 座標系」的權重，避免把 branch1/2(128) 與
-    # grouped deconv 分支權重軸(out/groups=16)混入同一節點，導致向量拼接維度衝突。
+    # P6a/P6b/P6c：final add (cat + x_residual) 的等價近似子支點。
+    # - 每個子節點包含：cat 來源分支末端座標 + residual 對應 slice。
+    # - 維度分別固定為 128 / 128 / 64，避免不同 n 混入同節點。
+
+    # P6a：cat 前半段（branch1, 128） <-> residual[:128]
     cur_perm += 1
     perm[cur_perm] = [
-        # 最終相加中的 residual 分支輸出（320）
-        [0, f"{prefix}.res.weight"],
-        # 下游 head（linear_test）輸入（320）
+        [0, f"{prefix}.branch1_3_2.pointwise.weight"],
+        [0, f"{prefix}.branch1_3_2.bn.weight"],
+        [0, f"{prefix}.branch1_3_2.bn.bias"],
+        [0, f"{prefix}.branch1_3_2.bn.running_mean", running_cfg],
+        [0, f"{prefix}.branch1_3_2.bn.running_var", running_cfg],
+        [0, f"{prefix}.res.weight", {"slice": (0, 128)}],
+    ]
+
+    # P6b：cat 中段（branch2, 128） <-> residual[128:256]
+    cur_perm += 1
+    perm[cur_perm] = [
+        [0, f"{prefix}.branch2_3_2.pointwise.weight"],
+        [0, f"{prefix}.branch2_3_2.bn.weight"],
+        [0, f"{prefix}.branch2_3_2.bn.bias"],
+        [0, f"{prefix}.branch2_3_2.bn.running_mean", running_cfg],
+        [0, f"{prefix}.branch2_3_2.bn.running_var", running_cfg],
+        [0, f"{prefix}.res.weight", {"slice": (128, 256)}],
+    ]
+
+    # P6c：cat 後段（branch3, 64） <-> residual[256:320]
+    cur_perm += 1
+    perm[cur_perm] = [
+        [0, f"{prefix}.branch3_3.deconv.weight"],
+        [0, f"{prefix}.branch3_3.bn.weight"],
+        [0, f"{prefix}.branch3_3.bn.bias"],
+        [0, f"{prefix}.branch3_3.bn.running_mean", running_cfg],
+        [0, f"{prefix}.branch3_3.bn.running_var", running_cfg],
+        [0, f"{prefix}.res.weight", {"slice": (256, 320)}],
+    ]
+
+    # P7：linear_test 輸入座標整段（320）錨點。
+    # 保持 linear_test 只受整段規則約束，不與分段節點混掛。
+    cur_perm += 1
+    perm[cur_perm] = [
         [1, "linear_test.conv.weight", IN_CFG],
     ]
 
