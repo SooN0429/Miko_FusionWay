@@ -22,9 +22,8 @@ DEFAULT_PREFIXES = [
 
 '''
 執行範例：
-python training_free_model_merging/homogeneous_tasks/Base_network_mudsc_concept_merging.py \
-  --checkpoints /path/to/model_a.pth /path/to/model_b.pth \
-  --output /path/to/merged.pth \
+python Base_network_mudsc_concept_merging.py \
+  --checkpoints "/media/user0309/ADATA HV620S/lab/trained_model_cpt/models/source/source_badnets_clean.pth" "/media/user0309/ADATA HV620S/lab/trained_model_cpt/models/target/target_clean_refool.pth" \
   --in-weight-space \
   --use-permute \
   --fix-sims \
@@ -60,7 +59,7 @@ def parse_args():
         choices=["base_only", "base_plus_convm2"],
         help="對齊規則覆蓋範圍（非融合策略）：base_only=僅 backbone，base_plus_convm2=backbone + convm2。",
     )
-    parser.add_argument("--convm2-prefix", default="base_network.convm2_layer.0")
+    parser.add_argument("--convm2-prefix", default="convm2_layer.0")
     parser.add_argument("--ignore-running-val", action="store_true")
     '''
     融合/最佳化超參數（傳給 weight fusion）

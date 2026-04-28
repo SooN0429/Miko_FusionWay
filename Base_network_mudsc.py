@@ -228,7 +228,7 @@ class WeightFusion:
         if return_state_dict:
             return self.get_merged_state_dict(no_avg=True)
         return self.fusion_model
-
+    # 這裡的寫法是為了forward時讓參數需求與base network相同而寫的
     @staticmethod
     def _unpack_act_batch(batch):
         """
@@ -279,7 +279,7 @@ class WeightFusion:
             return net(x, test_flag)
         except TypeError:
             return net(x)
-
+    # 到這裡
     def gen_act_sims(self, nets, act_loader: DataLoader):
         sims_dict = {k: CovarianceMetric() for k in self.perm}
         device = list(nets[0].parameters())[0].device
@@ -756,10 +756,9 @@ def get_convm2_perm(prefix="convm2_layer.0", ignore_running_val=True, include_fi
     ]
     cur_perm += 1
 
-    # P5：branch3 路徑 (64)：branch3_1 -> branch3_2(deconv) -> branch3_3(deconv)
-    # ConvTranspose2d 的權重形狀為 [in_c, out_c/groups, k, k]，因此：
-    # - axis 0 對應輸入通道座標，
-    # - axis 1 對應輸出通道座標。
+    # P5：branch3 主座標節點 (64)：僅保留 n=64 的權重軸。
+    # ConvTranspose2d 於 groups>1 時，axis 1 對應 out_c/groups（本模型為 16），
+    # 不能與 n=64 的項目放在同一節點，否則 get_weight_vectors 會在 concat 時維度衝突。
     perm[cur_perm] = [
         [0, f"{prefix}.branch3_1.conv.weight"],
         [0, f"{prefix}.branch3_1.bn.weight"],
@@ -767,49 +766,40 @@ def get_convm2_perm(prefix="convm2_layer.0", ignore_running_val=True, include_fi
         [0, f"{prefix}.branch3_1.bn.running_mean", running_cfg],
         [0, f"{prefix}.branch3_1.bn.running_var", running_cfg],
         [0, f"{prefix}.branch3_2.deconv.weight", IN_CFG],
-        [1, f"{prefix}.branch3_2.deconv.weight"],
         [0, f"{prefix}.branch3_2.bn.weight"],
         [0, f"{prefix}.branch3_2.bn.bias"],
         [0, f"{prefix}.branch3_2.bn.running_mean", running_cfg],
         [0, f"{prefix}.branch3_2.bn.running_var", running_cfg],
         [0, f"{prefix}.branch3_3.deconv.weight", IN_CFG],
-        [1, f"{prefix}.branch3_3.deconv.weight"],
         [0, f"{prefix}.branch3_3.bn.weight"],
         [0, f"{prefix}.branch3_3.bn.bias"],
         [0, f"{prefix}.branch3_3.bn.running_mean", running_cfg],
         [0, f"{prefix}.branch3_3.bn.running_var", running_cfg],
     ]
 
-    # P6：最終輸出座標，對應 (cat(x_branch1, x_branch2, x_branch3) + x_residual)
-    # 將最終相加兩側的來源分支(x_branch1, x_branch2, x_branch3、x_residual)綁到同一座標系，並把該座標串接到 linear_test 的輸入。
-    '''
-    cat+x_residual的部分，採與add支點相同概念 (由於進入支點的輸出已經是經過跨模型對齊後的結果了，並非是單模型訓練下的狀態，因此需要
-    在相加時進行輸出的通道對齊) 進行實作的話，就是將cat用到的輸入:x_branch1, x_branch2, x_branch3的輸出以及x_residual的輸出，
-    兩者的座標放入perm中約束。
-    "在單模型訓練時，Add 兩側會被共同訓練「自然協調」；
-    在跨模型融合時，進入支點的是「各自模型對齊後」的表示，不一定天然同座標，因此要在支點前施加通道對應約束。"
-    '''
+    # P5b：grouped deconv 的 group-內座標節點 (16)。
+    # 專門放 ConvTranspose2d 的 axis=1（out_c/groups）以保持節點內 n 一致。
     cur_perm += 1
     perm[cur_perm] = [
-        # cat 的三個來源分支：branch1/2/3 最終輸出
-        [0, f"{prefix}.branch1_3_2.pointwise.weight"],
-        [0, f"{prefix}.branch1_3_2.bn.weight"],
-        [0, f"{prefix}.branch1_3_2.bn.bias"],
-        [0, f"{prefix}.branch1_3_2.bn.running_mean", running_cfg],
-        [0, f"{prefix}.branch1_3_2.bn.running_var", running_cfg],
-        [0, f"{prefix}.branch2_3_2.pointwise.weight"],
-        [0, f"{prefix}.branch2_3_2.bn.weight"],
-        [0, f"{prefix}.branch2_3_2.bn.bias"],
-        [0, f"{prefix}.branch2_3_2.bn.running_mean", running_cfg],
-        [0, f"{prefix}.branch2_3_2.bn.running_var", running_cfg],
+        [1, f"{prefix}.branch3_2.deconv.weight"],
         [1, f"{prefix}.branch3_3.deconv.weight"],
-        [0, f"{prefix}.branch3_3.bn.weight"],
-        [0, f"{prefix}.branch3_3.bn.bias"],
-        [0, f"{prefix}.branch3_3.bn.running_mean", running_cfg],
-        [0, f"{prefix}.branch3_3.bn.running_var", running_cfg],
-        # 最終相加中的 residual 分支輸出
+    ]
+    # 原說法：
+            # P6：最終輸出座標，對應 (cat(x_branch1, x_branch2, x_branch3) + x_residual)
+            # 將最終相加兩側的來源分支(x_branch1, x_branch2, x_branch3、x_residual)綁到同一座標系，並把該座標串接到 linear_test 的輸入。
+            #cat+x_residual的部分，採與add支點相同概念 (由於進入支點的輸出已經是經過跨模型對齊後的結果了，並非是單模型訓練下的狀態，因此需要
+            #在相加時進行輸出的通道對齊) 進行實作的話，就是將cat用到的輸入:x_branch1, x_branch2, x_branch3的輸出以及x_residual的輸出，
+            #兩者的座標放入perm中約束。
+            #"在單模型訓練時，Add 兩側會被共同訓練「自然協調」；
+            #在跨模型融合時，進入支點的是「各自模型對齊後」的表示，不一定天然同座標，因此要在支點前施加通道對應約束。"
+    # P6：最終輸出座標錨點，對應 conv_M2 最終 320 通道輸出 -> linear_test 輸入。
+    # 注意：這裡僅保留「同一 320 座標系」的權重，避免把 branch1/2(128) 與
+    # grouped deconv 分支權重軸(out/groups=16)混入同一節點，導致向量拼接維度衝突。
+    cur_perm += 1
+    perm[cur_perm] = [
+        # 最終相加中的 residual 分支輸出（320）
         [0, f"{prefix}.res.weight"],
-        # 下游 head（linear_test）輸入
+        # 下游 head（linear_test）輸入（320）
         [1, "linear_test.conv.weight", IN_CFG],
     ]
 
